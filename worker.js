@@ -1,22 +1,15 @@
 /* ============================================================
-   CACTUC LUDO — Cloudflare Worker backend
-   - Serves the multiplayer game page
-   - Handles Telegram bot webhook (/start -> opens the game)
-   - Runs a Durable Object "LudoRoom" per room code for live
-     4-player sync over WebSocket
+   CACTUC LUDO — Cloudflare Worker backend (v2)
+   Changes from v1:
+   - Room creator picks 2, 3, or 4 players (not always 4)
+   - Fixed: first player no longer gets stuck on the waiting
+     screen once the room fills up
    ============================================================
-
-   DEPLOY NOTES (read before pasting into Cloudflare):
-   1. This needs a Durable Object binding named LUDO_ROOM
-      pointing at the class LudoRoom below.
-   2. Set a secret env var BOT_TOKEN = your bot token from BotFather.
-   3. After deploy, visit once in Safari:
-      https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=<YOUR_WORKER_URL>/webhook
-      (replace <YOUR_TOKEN> and <YOUR_WORKER_URL> — do this from your phone)
-   Full step-by-step is in the chat reply.
+   DEPLOY: replace the ENTIRE contents of worker.js in your
+   GitHub repo with this file, then commit. wrangler.toml and
+   your BOT_TOKEN / webhook do NOT need to change.
 ============================================================ */
 
-/* ---------------- shared game rules (also duplicated in client) ---------------- */
 const COLORS = ['red','green','yellow','blue'];
 function rot(r,c){ return [c, 14-r]; }
 let baseArm = [[6,1],[6,2],[6,3],[6,4],[6,5],[5,6],[4,6],[3,6],[2,6],[1,6],[0,6],[0,7],[0,8]];
@@ -90,18 +83,21 @@ function applyMove(g,color,idx,val){
   return {forwardPath, captures, finishedNow};
 }
 
-/* ---------------- Durable Object: one live room ---------------- */
 export class LudoRoom {
   constructor(state, env){
     this.state = state;
     this.env = env;
-    this.sessions = [];   // {ws, color}
-    this.joined = [];     // colors in join order
+    this.sessions = [];
+    this.joined = [];
     this.game = null;
+    this.maxPlayers = null;
   }
 
   async fetch(request){
     if(request.headers.get('Upgrade') === 'websocket'){
+      const url = new URL(request.url);
+      const maxParam = parseInt(url.searchParams.get('max'));
+      if(!this.maxPlayers && maxParam>=2 && maxParam<=4) this.maxPlayers = maxParam;
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       this.handleSession(server);
@@ -122,12 +118,20 @@ export class LudoRoom {
     const session = { ws, color };
     this.sessions.push(session);
 
-    if(this.joined.length >= 2 && !this.game){
+    const need = this.maxPlayers || 4;
+    let justStarted = false;
+    if(this.joined.length >= need && !this.game){
       this.game = createGame(this.joined.slice());
+      justStarted = true;
     }
 
-    ws.send(JSON.stringify({type:'welcome', color, joined:this.joined.slice(), game:this.game}));
-    this.broadcastLobby();
+    ws.send(JSON.stringify({type:'welcome', color, joined:this.joined.slice(), game:this.game, max:this.maxPlayers||4}));
+
+    if(justStarted){
+      this.broadcastAll({type:'action', actionKind:'start', game:this.game});
+    } else {
+      this.broadcastLobby();
+    }
 
     ws.addEventListener('message', (evt)=>{
       let data; try{ data = JSON.parse(evt.data); }catch(e){ return; }
@@ -139,7 +143,7 @@ export class LudoRoom {
   }
 
   broadcastLobby(){
-    this.broadcastAll({type:'lobby', joined:this.joined.slice(), started: !!this.game});
+    this.broadcastAll({type:'lobby', joined:this.joined.slice(), started: !!this.game, max:this.maxPlayers||4});
   }
   broadcastAll(obj){
     const str = JSON.stringify(obj);
@@ -183,17 +187,12 @@ export class LudoRoom {
   }
 }
 
-/* ---------------- main Worker fetch handler ---------------- */
 export default {
   async fetch(request, env){
     const url = new URL(request.url);
-
-    // Telegram webhook
     if(url.pathname === '/webhook'){
       return handleTelegramWebhook(request, env);
     }
-
-    // WebSocket room connections: /room/ABCD
     if(url.pathname.startsWith('/room/')){
       const code = url.pathname.split('/room/')[1];
       if(!code) return new Response('missing room code', {status:400});
@@ -201,8 +200,6 @@ export default {
       const stub = env.LUDO_ROOM.get(id);
       return stub.fetch(request);
     }
-
-    // everything else: serve the game page
     return new Response(GAME_HTML, { headers: { 'content-type': 'text/html;charset=UTF-8' } });
   }
 };
@@ -228,7 +225,6 @@ async function handleTelegramWebhook(request, env){
   return new Response('ok');
 }
 
-/* ---------------- client page (multiplayer) ---------------- */
 const GAME_HTML = `<!DOCTYPE html>
 <html lang="fa">
 <head>
@@ -258,12 +254,16 @@ const GAME_HTML = `<!DOCTYPE html>
   #lobby { padding: 20px; text-align: center; max-width: 380px; }
   #lobby h2 { font-size: 22px; margin-bottom: 4px; }
   #lobby p { opacity: 0.85; font-size: 14px; }
-  .lobby-btn { display:block; width:100%; margin:10px 0; padding:14px; border-radius: 16px; border:none;
-    background: linear-gradient(160deg,#ffe08a,#ffc93c); font-weight:bold; font-size:16px; color:#2a1e00; }
+  .lobby-btn { display:block; width:100%; margin:8px 0; padding:13px; border-radius: 16px; border:none;
+    background: linear-gradient(160deg,#ffe08a,#ffc93c); font-weight:bold; font-size:15px; color:#2a1e00; }
+  .lobby-sub { font-size: 12px; opacity: 0.7; margin: 14px 0 4px; }
+  .opt-row { display:flex; gap:8px; justify-content:center; margin-bottom: 10px; }
+  .opt-btn { flex:1; padding: 11px 6px; border-radius: 14px; border: 2px solid #3d4270;
+    background:#171a35; color:#fff; font-size: 14px; font-weight:bold; }
+  .opt-btn.sel { border-color:#ffd166; background:#2c3160; }
   #joinCodeInput, #prizeSetupInput { width:100%; padding:12px; border-radius:12px; border:2px solid #3d4270;
     background:#171a35; color:#fff; font-size:16px; text-align:center; margin-top:8px; text-transform:uppercase; }
   #roomCodeShow { font-size: 34px; font-weight:900; letter-spacing:6px; color:#ffd166; margin:14px 0; }
-  #waitingNote { font-size: 13px; opacity:0.8; margin-top:10px; }
 
   .ctrl-bar { direction: ltr; display: flex; justify-content: space-between; width: 94vw; max-width: 430px; margin: 4px 0; }
   .ctrl-slot { display: flex; align-items: center; gap: 4px; opacity: 0.45; transition: opacity 0.25s;
@@ -279,9 +279,6 @@ const GAME_HTML = `<!DOCTYPE html>
   .pip { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
   .pip span { width: 5.5px; height: 5.5px; border-radius: 50%; background: #222; display: none; }
   .pip.on span { display: block; }
-  .tap-hint { position: absolute; top: 50%; left: -18px; transform: translateY(-50%); font-size: 15px; opacity: 0; animation: sideHint 1s infinite; }
-  .ctrl-slot.enabled .tap-hint { opacity: 1; }
-  @keyframes sideHint { 0%,100%{transform:translateY(-50%) translateX(0)} 50%{transform:translateY(-50%) translateX(4px)} }
 
   #board-wrap { width: 94vw; max-width: 430px; aspect-ratio: 1/1; position: relative; border-radius: 16px; overflow: hidden;
     box-shadow: 0 12px 32px rgba(0,0,0,0.55), 0 0 0 4px #1c2040; margin: 6px 0; }
@@ -303,7 +300,15 @@ const GAME_HTML = `<!DOCTYPE html>
 <div id="lobby">
   <h2>بازی آنلاین لودو</h2>
   <p>با دوستات از گوشی‌های جدا بازی کن</p>
+
+  <div class="lobby-sub">چند نفره بسازیم؟</div>
+  <div class="opt-row">
+    <div class="opt-btn sel" id="opt2">۲ نفره</div>
+    <div class="opt-btn" id="opt3">۳ نفره</div>
+    <div class="opt-btn" id="opt4">۴ نفره</div>
+  </div>
   <button class="lobby-btn" id="createBtn">🎲 ساخت اتاق جدید</button>
+
   <input id="joinCodeInput" placeholder="کد اتاق رو وارد کن" maxlength="4">
   <button class="lobby-btn" id="joinBtn">پیوستن به اتاق</button>
   <input id="prizeSetupInput" placeholder="جایزه (اختیاری)" maxlength="40" style="margin-top:14px">
@@ -378,6 +383,7 @@ function yardXY(color, slot){
 
 const FINISH_POS = 55;
 let myColor = null, activeColors = [], state = null, animating=false, ws=null, roomCode='';
+let chosenMax = 2;
 
 function drawStatic(){
   let html = '<rect x="0" y="0" width="400" height="400" fill="#f3f5fb"/>';
@@ -462,9 +468,6 @@ function drawPiecesFixed(){
   });
   const layer = document.getElementById('piecesLayer');
   layer.innerHTML = html;
-  layer.querySelectorAll('.piece.movable').forEach((el,i)=>{
-    const m = meta.filter((mm,ix)=> layer.querySelectorAll('.piece')[ix]===el)[0];
-  });
   const groups = layer.querySelectorAll('.piece');
   groups.forEach((el,i)=>{
     if(el.classList.contains('movable')){
@@ -497,7 +500,7 @@ function renderUI(){
   if(state && state.prize){ pb.style.display='inline-block'; pb.textContent = '🏆 جایزه: '+state.prize; }
   else pb.style.display='none';
 
-  if(!state){ st.textContent=''; return; }
+  if(!state){ return; }
   if(state.gameOver) return;
   const curC = state.order[state.turn];
   const name = COLOR_NAME[curC] + (curC===myColor?' (تو)':'');
@@ -536,8 +539,7 @@ function buildBars(){
     const slot = document.createElement('div');
     slot.className='ctrl-slot'; slot.id='slot-'+c;
     slot.innerHTML = \`<div class="pin-ico" style="background:\${HEX[c]}"></div>
-      <div class="mini-dice" id="dice-\${c}">\${pipGridHTML()}</div>
-      <div class="tap-hint">👈</div>\`;
+      <div class="mini-dice" id="dice-\${c}">\${pipGridHTML()}</div>\`;
     slot.querySelector('.mini-dice').addEventListener('click', ()=> sendRoll(c));
     return slot;
   }
@@ -567,7 +569,23 @@ async function retreatToYard(color, idx, fromPos){
   }
 }
 
+function enterGame(game){
+  activeColors = game.order.slice();
+  state = game;
+  document.getElementById('lobby').style.display='none';
+  document.getElementById('gameArea').style.display='flex';
+  buildBars(); drawStatic(); render();
+}
+
 async function replayAction(action){
+  if(action.actionKind==='start'){
+    enterGame(action.game);
+    return;
+  }
+  if(action.actionKind==='prize'){
+    state = action.game; render();
+    return;
+  }
   animating = true;
   if(action.actionKind==='roll'){
     const diceEl = document.getElementById('dice-'+action.color);
@@ -599,52 +617,45 @@ async function replayAction(action){
     animating=false;
     if(state.gameOver){ sndWin(); document.getElementById('status').textContent = '🎉 '+COLOR_NAME[state.finishOrder[0]]+' پادشاه شد! 🎉' + (state.prize? ' — 🏆 '+state.prize:''); }
     render();
-  } else if(action.actionKind==='prize'){
-    state = action.game; render();
   }
 }
 
-function connect(code, prize){
+function connect(code, prize, max){
   roomCode = code.toUpperCase();
-  document.getElementById('lobby').style.display='none';
-  document.getElementById('gameArea').style.display='flex';
   document.getElementById('roomCodeShow').textContent = roomCode;
   const proto = location.protocol==='https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto+'//'+location.host+'/room/'+roomCode);
+  let wsUrl = proto+'//'+location.host+'/room/'+roomCode;
+  if(max) wsUrl += '?max='+max;
+  ws = new WebSocket(wsUrl);
   ws.addEventListener('open', ()=>{
     if(prize) ws.send(JSON.stringify({type:'setPrize', prize}));
   });
   ws.addEventListener('message', (evt)=>{
     const data = JSON.parse(evt.data);
-    if(data.type==='full'){ document.getElementById('status').textContent='اتاق پره 😅'; return; }
+    if(data.type==='full'){ alert('اتاق پره 😅'); return; }
     if(data.type==='welcome'){
       myColor = data.color;
-      document.getElementById('waitingNote').textContent = '';
       if(data.game){
-        activeColors = data.game.order.slice();
-        state = data.game;
-        buildBars(); drawStatic(); render();
+        enterGame(data.game);
       } else {
-        document.getElementById('status').textContent = 'منتظر بقیه‌ی بازیکنا... ('+data.joined.length+'/4)';
+        document.getElementById('gameArea').style.display='flex';
+        document.getElementById('lobby').style.display='none';
+        document.getElementById('status').textContent = 'منتظر بقیه‌ی بازیکنا... ('+data.joined.length+'/'+data.max+')';
       }
       return;
     }
     if(data.type==='lobby'){
       if(!state){
-        document.getElementById('status').textContent = 'منتظر بقیه‌ی بازیکنا... ('+data.joined.length+'/4)';
-        if(data.started){
-          // game just started from someone else joining — we need our own welcome's game; ask server implicitly via next action, or just reload state on first action.
-        }
+        document.getElementById('status').textContent = 'منتظر بقیه‌ی بازیکنا... ('+data.joined.length+'/'+data.max+')';
       }
       return;
     }
     if(data.type==='action'){
-      if(!activeColors.length && data.game){ activeColors = data.game.order.slice(); buildBars(); drawStatic(); }
       replayAction(data);
     }
   });
   ws.addEventListener('close', ()=>{
-    document.getElementById('status').textContent = 'اتصال قطع شد 😔';
+    if(document.getElementById('status')) document.getElementById('status').textContent = 'اتصال قطع شد 😔';
   });
 }
 
@@ -653,19 +664,27 @@ function randomCode(){
   let s=''; for(let i=0;i<4;i++) s+=chars[Math.floor(Math.random()*chars.length)];
   return s;
 }
+
+['opt2','opt3','opt4'].forEach((id,i)=>{
+  document.getElementById(id).addEventListener('click', ()=>{
+    chosenMax = i+2;
+    ['opt2','opt3','opt4'].forEach(x=> document.getElementById(x).classList.remove('sel'));
+    document.getElementById(id).classList.add('sel');
+  });
+});
+
 document.getElementById('createBtn').addEventListener('click', ()=>{
   ensureAudio();
   const code = randomCode();
   const prize = document.getElementById('prizeSetupInput').value.trim();
-  connect(code, prize);
+  connect(code, prize, chosenMax);
 });
 document.getElementById('joinBtn').addEventListener('click', ()=>{
   ensureAudio();
   const code = document.getElementById('joinCodeInput').value.trim();
   if(code.length!==4){ alert('کد ۴ کاراکتریه'); return; }
-  connect(code, '');
+  connect(code, '', null);
 });
 </script>
 </body>
 </html>`;
-// v2
