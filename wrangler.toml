@@ -1,0 +1,11 @@
+name = "cactucludo"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+[[durable_objects.bindings]]
+name = "LUDO_ROOM"
+class_name = "LudoRoom"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["LudoRoom"]
