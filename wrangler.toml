@@ -4,7 +4,7 @@ compatibility_date = "2024-09-01"
 
 [[durable_objects.bindings]]
 name = "LUDO_ROOM"
-class_name = "LudoRoom"
+new_sqlite_classes = ["LudoRoom"]
 
 [[migrations]]
 tag = "v1"
