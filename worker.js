@@ -1,27 +1,24 @@
 /* ============================================================
-   CACTUC LUDO — Cloudflare Worker backend (v4)
-   Fixes in this version (from real playtesting):
-   - Reconnection: if someone's connection drops mid-game, they
-     automatically rejoin with their SAME color and the game
-     continues (no more permanent "connection lost")
-   - Pieces that reach the final cell now go fully "home" (hidden,
-     celebration fires) instead of getting visually stuck at the edge
-   - When several pieces share a safe square, they fan out so every
-     one is visible and clickable (not just the top one)
-   - The glowing ring on movable pieces is now visible to EVERYONE
-     in the room, not just the player whose turn it is
-   - Prize set before the room fills up is no longer lost
-   - 2-player rooms now use opposite corners (face to face)
-   - Nicer /start welcome + a button linking to your channel
-   Everything from v3 (language settings, room-code share text,
-   copy button, tap hint, 5-star rating, footer credit) is kept.
+   CACTUC LUDO — Cloudflare Worker backend (v5)
+   New in this version:
+   - "Play vs Computer" button: instant solo game, no code needed
+   - Real reconnection fix: the browser remembers your room code
+     and color (localStorage), so if the app reloads or the
+     connection drops, reopening it shows "Resume game" and you
+     rejoin with the SAME color — never "room full" again
+   - Server-side rejoin is now more forceful: it reclaims your
+     color even if the old connection hadn't fully closed yet
+   Everything from v4 (reconnect-on-drop, stuck-piece fix, ring
+   visible to everyone, prize fix, face-to-face 2-player, i18n,
+   settings, rating, share/copy code, footer, channel button)
+   is kept.
    ============================================================
    DEPLOY: replace the ENTIRE contents of worker.js in GitHub with
-   this file and commit. Nothing else (wrangler.toml, secrets,
-   webhook) needs to change.
+   this file and commit. Nothing else needs to change.
 ============================================================ */
 
 const COLORS = ['red','green','yellow','blue'];
+const BOT_COLOR = 'yellow';
 function rot(r,c){ return [c, 14-r]; }
 let baseArm = [[6,1],[6,2],[6,3],[6,4],[6,5],[5,6],[4,6],[3,6],[2,6],[1,6],[0,6],[0,7],[0,8]];
 let PATH = [];
@@ -98,6 +95,22 @@ function poolFor(max){
   if(max===3) return ['red','green','yellow'];
   return COLORS;
 }
+function pickBotMove(g, color, movable, val){
+  for(const m of movable){
+    const cur = g.pieces[color][m.piece];
+    const target = cur===-1?0:cur+val;
+    if(target<=50 && !isSafeRel(color,target)){
+      const abs=(START_IDX[color]+target)%52;
+      let capture=false;
+      g.order.forEach(oc=>{ if(oc===color) return; g.pieces[oc].forEach(opos=>{ if(opos!==-1&&opos<=50&&(START_IDX[oc]+opos)%52===abs) capture=true; }); });
+      if(capture) return m;
+    }
+  }
+  for(const m of movable){ const cur=g.pieces[color][m.piece]; const target=cur===-1?0:cur+val; if(target===FINISH_POS) return m; }
+  const onBoard = movable.filter(m=>g.pieces[color][m.piece]!==-1);
+  if(onBoard.length){ onBoard.sort((a,b)=> g.pieces[color][b.piece]-g.pieces[color][a.piece]); return onBoard[0]; }
+  return movable[0];
+}
 
 export class LudoRoom {
   constructor(state, env){
@@ -108,6 +121,7 @@ export class LudoRoom {
     this.game = null;
     this.maxPlayers = null;
     this.pendingPrize = '';
+    this.isBotRoom = false;
   }
 
   async fetch(request){
@@ -117,6 +131,7 @@ export class LudoRoom {
       const maxParam = parseInt(url.searchParams.get('max'));
       if(!this.maxPlayers && maxParam>=2 && maxParam<=4) this.maxPlayers = maxParam;
       const rejoin = url.searchParams.get('rejoin');
+      if(url.searchParams.get('bot')==='1') this.isBotRoom = true;
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       this.handleSession(server, rejoin);
@@ -150,11 +165,15 @@ export class LudoRoom {
     ws.accept();
     let color;
     let isReconnect = false;
-    if(rejoinColor && this.joined.includes(rejoinColor) && !this.sessions.some(s=>s.color===rejoinColor)){
+    if(rejoinColor && this.joined.includes(rejoinColor)){
       color = rejoinColor;
       isReconnect = true;
+      this.sessions = this.sessions.filter(s=>{
+        if(s.color===color){ try{ s.ws.close(); }catch(e){} return false; }
+        return true;
+      });
     } else {
-      const pool = poolFor(this.maxPlayers||4);
+      const pool = this.isBotRoom ? ['red'] : poolFor(this.maxPlayers||4);
       color = pool.find(c => !this.joined.includes(c));
       if(!color){
         ws.send(JSON.stringify({type:'full'}));
@@ -166,18 +185,29 @@ export class LudoRoom {
     const session = { ws, color };
     this.sessions.push(session);
 
-    const need = this.maxPlayers || 4;
     let justStarted = false;
-    if(!isReconnect && this.joined.length >= need && !this.game){
-      this.game = createGame(this.joined.slice());
-      if(this.pendingPrize) this.game.prize = this.pendingPrize;
-      justStarted = true;
+    if(!isReconnect && !this.game){
+      if(this.isBotRoom){
+        this.maxPlayers = 2;
+        this.joined.push(BOT_COLOR);
+        this.game = createGame([color, BOT_COLOR]);
+        if(this.pendingPrize) this.game.prize = this.pendingPrize;
+        justStarted = true;
+      } else {
+        const need = this.maxPlayers || 4;
+        if(this.joined.length >= need){
+          this.game = createGame(this.joined.slice());
+          if(this.pendingPrize) this.game.prize = this.pendingPrize;
+          justStarted = true;
+        }
+      }
     }
 
     ws.send(JSON.stringify({type:'welcome', color, joined:this.joined.slice(), game:this.game, max:this.maxPlayers||4}));
 
     if(justStarted){
       this.broadcastAll({type:'action', actionKind:'start', game:this.game});
+      this.maybeBotMove();
     } else if(!isReconnect){
       this.broadcastLobby();
     }
@@ -197,6 +227,33 @@ export class LudoRoom {
   broadcastAll(obj){
     const str = JSON.stringify(obj);
     this.sessions.forEach(s=>{ try{ s.ws.send(str); }catch(e){} });
+  }
+
+  async maybeBotMove(){
+    if(!this.isBotRoom || !this.game || this.game.gameOver) return;
+    if(this.game.order[this.game.turn] !== BOT_COLOR) return;
+    if(!this.game.canRoll) return;
+    await new Promise(r=>setTimeout(r,700));
+    const g = this.game;
+    if(!g || g.gameOver || g.order[g.turn]!==BOT_COLOR || !g.canRoll) return;
+    const val = 1+Math.floor(Math.random()*6);
+    g.diceValue=val; g.canRoll=false;
+    g.movable = computeMovable(g, BOT_COLOR, val);
+    let noMoves=false;
+    if(g.movable.length===0){
+      noMoves=true; const wasSix=val===6; g.diceValue=null; g.movable=[];
+      if(!wasSix){ let guard=0; do{ g.turn=(g.turn+1)%g.order.length; guard++; } while(g.finished[g.order[g.turn]]===4 && guard<10); }
+      g.canRoll=true;
+    }
+    this.broadcastAll({type:'action', actionKind:'roll', color:BOT_COLOR, val, noMoves, game:this.game});
+    if(!noMoves){
+      await new Promise(r=>setTimeout(r,650));
+      const m = pickBotMove(g, BOT_COLOR, g.movable, val);
+      const result = applyMove(g, BOT_COLOR, m.piece, val);
+      this.broadcastAll({type:'action', actionKind:'move', color:BOT_COLOR, piece:m.piece,
+        forwardPath:result.forwardPath, captures:result.captures, finishedNow:result.finishedNow, game:this.game});
+    }
+    this.maybeBotMove();
   }
 
   handleMessage(session, data){
@@ -226,6 +283,7 @@ export class LudoRoom {
         g.canRoll=true;
       }
       this.broadcastAll({type:'action', actionKind:'roll', color:session.color, val, noMoves, game:this.game});
+      this.maybeBotMove();
     } else if(data.type==='move'){
       if(g.order[g.turn]!==session.color) return;
       if(!g.movable.some(m=>m.piece===data.piece)) return;
@@ -234,6 +292,7 @@ export class LudoRoom {
       this.broadcastAll({type:'action', actionKind:'move', color:session.color, piece:data.piece,
         forwardPath:result.forwardPath, captures:result.captures, finishedNow:result.finishedNow,
         game:this.game});
+      this.maybeBotMove();
     }
   }
 }
@@ -271,7 +330,7 @@ async function handleTelegramWebhook(request, env){
       method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({
         chat_id: chatId,
-        text: '🌵 به CACTUC لودو خوش اومدی!\n\nبا دوستات یه اتاق آنلاین بساز، جایزه‌ای برای برنده بذار، و ببین امروز کی پادشاهه 👑🎲',
+        text: '🌵 به CACTUC لودو خوش اومدی!\n\nبا دوستات یه اتاق آنلاین بساز، جایزه‌ای برای برنده بذار، یا اگه تنهایی با کامپیوتر بازی کن. ببین امروز کی پادشاهه 👑🎲',
         reply_markup: { inline_keyboard: [
           [{ text: '🎲 بازی کن', web_app: { url: workerUrl } }],
           [{ text: '📢 کانال ما', url: 'https://t.me/CROOK_Cake' }]
@@ -316,6 +375,7 @@ const GAME_HTML = `<!DOCTYPE html>
   #lobby p { opacity: 0.85; font-size: 14px; }
   .lobby-btn { display:block; width:100%; margin:8px 0; padding:13px; border-radius: 16px; border:none;
     background: linear-gradient(160deg,#ffe08a,#ffc93c); font-weight:bold; font-size:15px; color:#2a1e00; }
+  .lobby-btn.alt { background:#2c3160; color:#fff; }
   .lobby-sub { font-size: 12px; opacity: 0.7; margin: 14px 0 4px; }
   .opt-row { display:flex; gap:8px; justify-content:center; margin-bottom: 10px; }
   .opt-btn { flex:1; padding: 11px 6px; border-radius: 14px; border: 2px solid #3d4270;
@@ -328,16 +388,20 @@ const GAME_HTML = `<!DOCTYPE html>
   #copyBtn { padding: 8px 20px; border-radius: 14px; border: 1px solid #3d4270; background:#1e2240; color:#fff; font-size:13px; margin-bottom: 10px; }
   #footerCredit { margin-top: 18px; font-size: 11px; opacity: 0.55; line-height: 1.7; text-align:center; }
   #footerCredit .handle { direction: ltr; unicode-bidi: isolate; display: inline-block; }
+  #resumeBox { display:none; margin-bottom: 12px; padding: 12px; background: rgba(255,209,102,0.14); border-radius: 14px; }
+  #resumeText { font-size: 13px; margin: 0 0 8px; }
 
   .ctrl-bar { direction: ltr; display: flex; justify-content: space-between; width: 94vw; max-width: 430px; margin: 4px 0; }
   .ctrl-slot { display: flex; align-items: center; gap: 4px; opacity: 0.45; transition: opacity 0.25s;
     background: rgba(255,255,255,0.08); padding: 5px 8px; border-radius: 12px; position: relative; }
   .ctrl-slot.slot-hidden { visibility: hidden; }
-  .ctrl-slot.enabled { opacity: 1; background: rgba(255,209,102,0.18); }
+  .ctrl-slot.current-turn { opacity: 1; background: rgba(10,12,28,0.55); }
+  .ctrl-slot.current-turn .mini-dice { border-color: #ffd166; background: linear-gradient(160deg,#fff3d0,#ffe08a); }
+  .ctrl-slot.enabled { background: rgba(255,209,102,0.22); }
   .pin-ico { width: 20px; height: 20px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.4); flex-shrink:0; }
   .mini-dice { width: 38px; height: 38px; background: linear-gradient(160deg,#ffffff,#e7e9f2); border-radius: 9px;
     display: grid; grid-template-columns: repeat(3,1fr); grid-template-rows: repeat(3,1fr); padding: 5px; border: 2px solid #c9cee0; }
-  .ctrl-slot.enabled .mini-dice { cursor: pointer; border-color: #ffd166; box-shadow: 0 0 10px rgba(255,209,102,0.65); }
+  .ctrl-slot.enabled .mini-dice { cursor: pointer; box-shadow: 0 0 10px rgba(255,209,102,0.65); }
   .mini-dice.rolling { animation: spin 0.42s linear infinite; }
   @keyframes spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
   .pip { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
@@ -384,6 +448,11 @@ const GAME_HTML = `<!DOCTYPE html>
   <h2 id="lobbyHeading">بازی آنلاین لودو</h2>
   <p id="lobbySub">با دوستات از گوشی‌های جدا بازی کن</p>
 
+  <div id="resumeBox">
+    <p id="resumeText"></p>
+    <button class="lobby-btn" id="resumeBtn"></button>
+  </div>
+
   <div class="lobby-sub" id="playersLabel">چند نفره بسازیم؟</div>
   <div class="opt-row">
     <div class="opt-btn sel" id="opt2">۲ نفره</div>
@@ -391,6 +460,7 @@ const GAME_HTML = `<!DOCTYPE html>
     <div class="opt-btn" id="opt4">۴ نفره</div>
   </div>
   <button class="lobby-btn" id="createBtn">🎲 ساخت اتاق جدید</button>
+  <button class="lobby-btn alt" id="botBtn">🤖 بازی با کامپیوتر (تنها)</button>
 
   <input id="joinCodeInput" placeholder="کد اتاق رو وارد کن" maxlength="4">
   <button class="lobby-btn" id="joinBtn">پیوستن به اتاق</button>
@@ -461,52 +531,57 @@ function sndSlither(duration){
 const I18N = {
   en: { dir:'ltr', langName:'English', title:'🎲 Ludo Online', lobbyHeading:'Play Ludo Online', lobbySub:'Play with friends on separate phones',
     playersLabel:'How many players?', p2:'2 Players', p3:'3 Players', p4:'4 Players', createBtn:'🎲 Create New Room',
-    joinPlaceholder:'Enter room code', joinBtn:'Join Room', prizePlaceholder:"Set the winner's prize (optional)",
+    botBtn:'🤖 Play vs Computer (solo)', joinPlaceholder:'Enter room code', joinBtn:'Join Room', prizePlaceholder:"Set the winner's prize (optional)",
     shareNote:'Share this code with your friends and ask them to enter it under "Join Room".',
     copyBtn:'📋 Copy Code', copied:'✅ Copied!', waiting:'Waiting for other players... ({j}/{m})',
     turnRoll:"{n}'s turn — tap your dice", pickPiece:'{n}: pick a piece (dice: {v})', noMove:'{n}: no moves, next turn...',
     win:'🎉 {n} is King! 🎉', presentPrize:'Prize for the winner: {p}', roomFull:'Room is full 😅', disconnected:'Connection lost 😔',
-    reconnecting:'Reconnecting...', settingsTitle:'Language', ok:'OK', footerLine1:'Creator: Nawid=cactuc', footerLine2:'Hope you enjoy the bot!',
+    reconnecting:'Reconnecting...', resumeText:'You have an unfinished game (code: {c})', resumeBtn:'▶️ Resume Game',
+    settingsTitle:'Language', ok:'OK', footerLine1:'Creator: Nawid=cactuc', footerLine2:'Hope you enjoy the bot!',
     ratePrompt:'How was it? Rate us!', rateThanks:'🙏 Thanks for your feedback!',
     red:'Red', green:'Green', yellow:'Yellow', blue:'Blue' },
   fa: { dir:'rtl', langName:'فارسی', title:'🎲 لودو آنلاین', lobbyHeading:'بازی آنلاین لودو', lobbySub:'با دوستات از گوشی‌های جدا بازی کن',
     playersLabel:'چند نفره بسازیم؟', p2:'۲ نفره', p3:'۳ نفره', p4:'۴ نفره', createBtn:'🎲 ساخت اتاق جدید',
-    joinPlaceholder:'کد اتاق رو وارد کن', joinBtn:'پیوستن به اتاق', prizePlaceholder:'جایزه‌ی برنده رو تعیین کن (اختیاری)',
+    botBtn:'🤖 بازی با کامپیوتر (تنها)', joinPlaceholder:'کد اتاق رو وارد کن', joinBtn:'پیوستن به اتاق', prizePlaceholder:'جایزه‌ی برنده رو تعیین کن (اختیاری)',
     shareNote:'این کد رو به رفیقت بده و بگو تو «پیوستن به اتاق» واردش کنه.',
     copyBtn:'📋 کپی کد', copied:'✅ کپی شد!', waiting:'منتظر بقیه‌ی بازیکنا... ({j}/{m})',
     turnRoll:'نوبت {n}: تاس خودتو بزن', pickPiece:'{n}: مهره رو انتخاب کن (تاس: {v})', noMove:'{n}: حرکتی نداری، نوبت بعدی...',
     win:'🎉 {n} پادشاه شد! 🎉', presentPrize:'جایزه رو تقدیم بقیه کن: {p}', roomFull:'اتاق پره 😅', disconnected:'اتصال قطع شد 😔',
-    reconnecting:'در حال وصل شدن دوباره...', settingsTitle:'زبان', ok:'باشه', footerLine1:'سازنده: Nawid=cactuc', footerLine2:'امیدوارم از ربات لذت ببرید 🥹',
+    reconnecting:'در حال وصل شدن دوباره...', resumeText:'یه بازی نیمه‌کاره داری (کد: {c})', resumeBtn:'▶️ ادامه‌ی بازی',
+    settingsTitle:'زبان', ok:'باشه', footerLine1:'سازنده: Nawid=cactuc', footerLine2:'امیدوارم از ربات لذت ببرید 🥹',
     ratePrompt:'بازی چطور بود؟ بهمون امتیاز بده', rateThanks:'🙏 ممنون از نظرت!',
     red:'قرمز', green:'سبز', yellow:'زرد', blue:'آبی' },
   ru: { dir:'ltr', langName:'Русский', title:'🎲 Лудо Онлайн', lobbyHeading:'Игра Лудо Онлайн', lobbySub:'Играйте с друзьями на разных телефонах',
     playersLabel:'Сколько игроков?', p2:'2 игрока', p3:'3 игрока', p4:'4 игрока', createBtn:'🎲 Создать комнату',
-    joinPlaceholder:'Введите код комнаты', joinBtn:'Присоединиться', prizePlaceholder:'Приз для победителя (необязательно)',
+    botBtn:'🤖 Игра против компьютера', joinPlaceholder:'Введите код комнаты', joinBtn:'Присоединиться', prizePlaceholder:'Приз для победителя (необязательно)',
     shareNote:'Отправьте этот код друзьям и попросите ввести его в «Присоединиться к комнате».',
     copyBtn:'📋 Копировать код', copied:'✅ Скопировано!', waiting:'Ожидание игроков... ({j}/{m})',
     turnRoll:'Ход {n} — нажмите свой кубик', pickPiece:'{n}: выберите фишку (кубик: {v})', noMove:'{n}: нет ходов, следующий ход...',
     win:'🎉 {n} — король! 🎉', presentPrize:'Приз победителю: {p}', roomFull:'Комната заполнена 😅', disconnected:'Соединение потеряно 😔',
-    reconnecting:'Переподключение...', settingsTitle:'Язык', ok:'ОК', footerLine1:'Автор: Nawid=cactuc', footerLine2:'Надеемся, вам понравится бот!',
+    reconnecting:'Переподключение...', resumeText:'У вас есть незавершённая игра (код: {c})', resumeBtn:'▶️ Продолжить игру',
+    settingsTitle:'Язык', ok:'ОК', footerLine1:'Автор: Nawid=cactuc', footerLine2:'Надеемся, вам понравится бот!',
     ratePrompt:'Как вам игра? Оцените нас!', rateThanks:'🙏 Спасибо за отзыв!',
     red:'Красный', green:'Зелёный', yellow:'Жёлтый', blue:'Синий' },
   ar: { dir:'rtl', langName:'العربية', title:'🎲 لودو أونلاين', lobbyHeading:'العب لودو أونلاين', lobbySub:'العب مع أصدقائك من هواتف منفصلة',
     playersLabel:'كم عدد اللاعبين؟', p2:'لاعبان', p3:'٣ لاعبين', p4:'٤ لاعبين', createBtn:'🎲 إنشاء غرفة جديدة',
-    joinPlaceholder:'أدخل رمز الغرفة', joinBtn:'الانضمام إلى الغرفة', prizePlaceholder:'حدد جائزة الفائز (اختياري)',
+    botBtn:'🤖 العب ضد الكمبيوتر', joinPlaceholder:'أدخل رمز الغرفة', joinBtn:'الانضمام إلى الغرفة', prizePlaceholder:'حدد جائزة الفائز (اختياري)',
     shareNote:'شارك هذا الرمز مع أصدقائك واطلب منهم إدخاله في «الانضمام إلى الغرفة».',
     copyBtn:'📋 نسخ الرمز', copied:'✅ تم النسخ!', waiting:'بانتظار بقية اللاعبين... ({j}/{m})',
     turnRoll:'دور {n} — اضغط على نردك', pickPiece:'{n}: اختر قطعة (النرد: {v})', noMove:'{n}: لا حركة، الدور التالي...',
     win:'🎉 {n} أصبح الملك! 🎉', presentPrize:'الجائزة للفائز: {p}', roomFull:'الغرفة ممتلئة 😅', disconnected:'انقطع الاتصال 😔',
-    reconnecting:'إعادة الاتصال...', settingsTitle:'اللغة', ok:'حسناً', footerLine1:'صانع اللعبة: Nawid=cactuc', footerLine2:'نتمنى أن تستمتع بالبوت!',
+    reconnecting:'إعادة الاتصال...', resumeText:'لديك لعبة غير مكتملة (الرمز: {c})', resumeBtn:'▶️ متابعة اللعبة',
+    settingsTitle:'اللغة', ok:'حسناً', footerLine1:'صانع اللعبة: Nawid=cactuc', footerLine2:'نتمنى أن تستمتع بالبوت!',
     ratePrompt:'كيف كانت اللعبة؟ قيّمنا!', rateThanks:'🙏 شكراً لتقييمك!',
     red:'أحمر', green:'أخضر', yellow:'أصفر', blue:'أزرق' },
   de: { dir:'ltr', langName:'Deutsch', title:'🎲 Ludo Online', lobbyHeading:'Ludo Online spielen', lobbySub:'Spiele mit Freunden auf getrennten Handys',
     playersLabel:'Wie viele Spieler?', p2:'2 Spieler', p3:'3 Spieler', p4:'4 Spieler', createBtn:'🎲 Neuen Raum erstellen',
-    joinPlaceholder:'Raumcode eingeben', joinBtn:'Raum beitreten', prizePlaceholder:'Preis für den Gewinner festlegen (optional)',
+    botBtn:'🤖 Gegen Computer spielen', joinPlaceholder:'Raumcode eingeben', joinBtn:'Raum beitreten', prizePlaceholder:'Preis für den Gewinner festlegen (optional)',
     shareNote:'Teile diesen Code mit deinen Freunden und lass sie ihn unter „Raum beitreten" eingeben.',
     copyBtn:'📋 Code kopieren', copied:'✅ Kopiert!', waiting:'Warte auf weitere Spieler... ({j}/{m})',
     turnRoll:'{n} ist dran — eigenen Würfel tippen', pickPiece:'{n}: Figur wählen (Würfel: {v})', noMove:'{n}: kein Zug möglich, nächster...',
     win:'🎉 {n} ist König! 🎉', presentPrize:'Preis für den Gewinner: {p}', roomFull:'Raum ist voll 😅', disconnected:'Verbindung verloren 😔',
-    reconnecting:'Verbinde erneut...', settingsTitle:'Sprache', ok:'OK', footerLine1:'Erstellt von: Nawid=cactuc', footerLine2:'Wir hoffen, der Bot gefällt dir!',
+    reconnecting:'Verbinde erneut...', resumeText:'Du hast ein unbeendetes Spiel (Code: {c})', resumeBtn:'▶️ Spiel fortsetzen',
+    settingsTitle:'Sprache', ok:'OK', footerLine1:'Erstellt von: Nawid=cactuc', footerLine2:'Wir hoffen, der Bot gefällt dir!',
     ratePrompt:'Wie war es? Bewerte uns!', rateThanks:'🙏 Danke für dein Feedback!',
     red:'Rot', green:'Grün', yellow:'Gelb', blue:'Blau' }
 };
@@ -517,6 +592,11 @@ function t(key, params){
   return s;
 }
 function meWord(){ return {fa:'تو',en:'you',ru:'ты',ar:'أنت',de:'du'}[lang]; }
+
+/* ---------- session persistence (fixes reconnect / room-full bug) ---------- */
+function saveSession(){ try{ localStorage.setItem('cactuc_session', JSON.stringify({code:roomCode, color:myColor, ts:Date.now()})); }catch(e){} }
+function loadSession(){ try{ const raw=localStorage.getItem('cactuc_session'); if(!raw) return null; const obj=JSON.parse(raw); if(Date.now()-obj.ts > 3*60*60*1000) return null; return obj; }catch(e){ return null; } }
+function clearSession(){ try{ localStorage.removeItem('cactuc_session'); }catch(e){} }
 
 const CELL = 400/15;
 const COLORS = ['red','green','yellow','blue'];
@@ -652,7 +732,6 @@ function drawPiecesFixed(){
   const layer = document.getElementById('piecesLayer');
   layer.innerHTML = html;
   layer.querySelectorAll('.piece.movable').forEach(el=>{
-    const c = el.getAttribute('data-color');
     const idx = parseInt(el.getAttribute('data-idx'));
     el.addEventListener('click', ()=> sendMove(idx));
   });
@@ -696,8 +775,10 @@ function renderUI(){
     const active = activeColors.includes(c);
     slot.classList.toggle('slot-hidden', !active);
     if(!active) return;
-    const isTurn = state.order[state.turn]===c && state.canRoll && !animating && !state.gameOver && c===myColor;
-    slot.classList.toggle('enabled', isTurn);
+    const isCurrentTurn = state.order[state.turn]===c && !state.gameOver;
+    const isClickable = isCurrentTurn && state.canRoll && !animating && c===myColor;
+    slot.classList.toggle('current-turn', isCurrentTurn);
+    slot.classList.toggle('enabled', isClickable);
   });
 }
 
@@ -824,6 +905,7 @@ async function replayAction(action){
       if(state.prize) msg += ' — ' + t('presentPrize',{p:state.prize});
       document.getElementById('status').textContent = msg;
       showRatingBox();
+      clearSession();
     }
     render();
   }
@@ -832,16 +914,17 @@ async function replayAction(action){
 function scheduleReconnect(){
   if(reconnecting || !myColor || !roomCode) return;
   reconnecting = true;
-  document.getElementById('status').textContent = t('reconnecting');
+  const st = document.getElementById('status');
+  if(st) st.textContent = t('reconnecting');
   setTimeout(()=>{ reconnecting = false; connect(roomCode, '', null, myColor); }, 1500);
 }
 
-function connect(code, prize, max, rejoinColor){
+function connect(code, prize, max, rejoinColor, botMode){
   roomCode = code.toUpperCase();
   document.getElementById('lobby').style.display='none';
   document.getElementById('gameArea').style.display='flex';
   document.getElementById('roomCodeShow').textContent = roomCode;
-  if(max){
+  if(max && !botMode){
     document.getElementById('shareNote').textContent = t('shareNote');
     const cbtn = document.getElementById('copyBtn');
     cbtn.style.display='inline-block';
@@ -853,12 +936,16 @@ function connect(code, prize, max, rejoinColor){
       cbtn.textContent = t('copied');
       setTimeout(()=> cbtn.textContent = t('copyBtn'), 1500);
     };
+  } else {
+    document.getElementById('shareNote').textContent = '';
+    document.getElementById('copyBtn').style.display = 'none';
   }
   const proto = location.protocol==='https:' ? 'wss:' : 'ws:';
   let wsUrl = proto+'//'+location.host+'/room/'+roomCode;
   const params = [];
   if(max) params.push('max='+max);
   if(rejoinColor) params.push('rejoin='+rejoinColor);
+  if(botMode) params.push('bot=1');
   if(params.length) wsUrl += '?'+params.join('&');
   ws = new WebSocket(wsUrl);
   ws.addEventListener('open', ()=>{
@@ -869,6 +956,7 @@ function connect(code, prize, max, rejoinColor){
     if(data.type==='full'){ alert(t('roomFull')); return; }
     if(data.type==='welcome'){
       myColor = data.color;
+      saveSession();
       if(data.game){
         enterGame(data.game);
       } else {
@@ -887,7 +975,7 @@ function connect(code, prize, max, rejoinColor){
     }
   });
   ws.addEventListener('close', ()=>{
-    if(state && !state.gameOver){
+    if(myColor && roomCode && !(state && state.gameOver)){
       scheduleReconnect();
     } else if(document.getElementById('status') && !state){
       document.getElementById('status').textContent = t('disconnected');
@@ -915,12 +1003,30 @@ document.getElementById('createBtn').addEventListener('click', ()=>{
   const prize = document.getElementById('prizeSetupInput').value.trim();
   connect(code, prize, chosenMax);
 });
+document.getElementById('botBtn').addEventListener('click', ()=>{
+  ensureAudio();
+  const code = randomCode();
+  connect(code, '', 2, null, true);
+});
 document.getElementById('joinBtn').addEventListener('click', ()=>{
   ensureAudio();
   const code = document.getElementById('joinCodeInput').value.trim();
   if(code.length!==4){ alert(lang==='fa'?'کد ۴ کاراکتریه':'Code is 4 characters'); return; }
   connect(code, '', null);
 });
+
+function checkResume(){
+  const s = loadSession();
+  const box = document.getElementById('resumeBox');
+  if(s){
+    box.style.display='block';
+    document.getElementById('resumeText').textContent = t('resumeText',{c:s.code});
+    document.getElementById('resumeBtn').textContent = t('resumeBtn');
+    document.getElementById('resumeBtn').onclick = ()=>{ ensureAudio(); connect(s.code, '', null, s.color); };
+  } else {
+    box.style.display='none';
+  }
+}
 
 function applyLangToLobby(){
   document.documentElement.dir = I18N[lang].dir;
@@ -932,12 +1038,14 @@ function applyLangToLobby(){
   document.getElementById('opt3').textContent = t('p3');
   document.getElementById('opt4').textContent = t('p4');
   document.getElementById('createBtn').textContent = t('createBtn');
+  document.getElementById('botBtn').textContent = t('botBtn');
   document.getElementById('joinCodeInput').placeholder = t('joinPlaceholder');
   document.getElementById('joinBtn').textContent = t('joinBtn');
   document.getElementById('prizeSetupInput').placeholder = t('prizePlaceholder');
   document.getElementById('footerCredit').innerHTML = t('footerLine1').replace('Nawid=cactuc','<span class="handle">Nawid=cactuc</span>') + '<br>' + t('footerLine2');
   document.getElementById('settingsTitle').textContent = t('settingsTitle');
   document.getElementById('closeSettings').textContent = t('ok');
+  checkResume();
   if(state) render();
 }
 function buildLangList(){
