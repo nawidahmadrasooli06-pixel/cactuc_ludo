@@ -1,13 +1,24 @@
 /* ============================================================
-   CACTUC LUDO — Cloudflare Worker backend (v2)
-   Changes from v1:
-   - Room creator picks 2, 3, or 4 players (not always 4)
-   - Fixed: first player no longer gets stuck on the waiting
-     screen once the room fills up
+   CACTUC LUDO — Cloudflare Worker backend (v4)
+   Fixes in this version (from real playtesting):
+   - Reconnection: if someone's connection drops mid-game, they
+     automatically rejoin with their SAME color and the game
+     continues (no more permanent "connection lost")
+   - Pieces that reach the final cell now go fully "home" (hidden,
+     celebration fires) instead of getting visually stuck at the edge
+   - When several pieces share a safe square, they fan out so every
+     one is visible and clickable (not just the top one)
+   - The glowing ring on movable pieces is now visible to EVERYONE
+     in the room, not just the player whose turn it is
+   - Prize set before the room fills up is no longer lost
+   - 2-player rooms now use opposite corners (face to face)
+   - Nicer /start welcome + a button linking to your channel
+   Everything from v3 (language settings, room-code share text,
+   copy button, tap hint, 5-star rating, footer credit) is kept.
    ============================================================
-   DEPLOY: replace the ENTIRE contents of worker.js in your
-   GitHub repo with this file, then commit. wrangler.toml and
-   your BOT_TOKEN / webhook do NOT need to change.
+   DEPLOY: replace the ENTIRE contents of worker.js in GitHub with
+   this file and commit. Nothing else (wrangler.toml, secrets,
+   webhook) needs to change.
 ============================================================ */
 
 const COLORS = ['red','green','yellow','blue'];
@@ -82,6 +93,11 @@ function applyMove(g,color,idx,val){
   }
   return {forwardPath, captures, finishedNow};
 }
+function poolFor(max){
+  if(max===2) return ['red','yellow'];
+  if(max===3) return ['red','green','yellow'];
+  return COLORS;
+}
 
 export class LudoRoom {
   constructor(state, env){
@@ -91,37 +107,70 @@ export class LudoRoom {
     this.joined = [];
     this.game = null;
     this.maxPlayers = null;
+    this.pendingPrize = '';
   }
 
   async fetch(request){
+    const url = new URL(request.url);
+
     if(request.headers.get('Upgrade') === 'websocket'){
-      const url = new URL(request.url);
       const maxParam = parseInt(url.searchParams.get('max'));
       if(!this.maxPlayers && maxParam>=2 && maxParam<=4) this.maxPlayers = maxParam;
+      const rejoin = url.searchParams.get('rejoin');
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      this.handleSession(server);
+      this.handleSession(server, rejoin);
       return new Response(null, { status: 101, webSocket: client });
     }
+
+    if(url.pathname === '/rate'){
+      if(request.method === 'POST'){
+        const body = await request.json().catch(()=>({}));
+        const stars = Math.max(1, Math.min(5, parseInt(body.stars)||0));
+        if(stars>0){
+          let stats = (await this.state.storage.get('stats')) || {count:0,sum:0,b1:0,b2:0,b3:0,b4:0,b5:0};
+          stats.count++; stats.sum += stars; stats['b'+stars] = (stats['b'+stars]||0)+1;
+          await this.state.storage.put('stats', stats);
+        }
+        return new Response('{"ok":true}', {headers:{'content-type':'application/json'}});
+      }
+      if(request.method === 'GET'){
+        const key = url.searchParams.get('key');
+        if(key !== 'cactuc580-report') return new Response('forbidden', {status:403});
+        let stats = (await this.state.storage.get('stats')) || {count:0,sum:0,b1:0,b2:0,b3:0,b4:0,b5:0};
+        const avg = stats.count ? (stats.sum/stats.count).toFixed(2) : '0';
+        return new Response(JSON.stringify({...stats, average:avg}, null, 2), {headers:{'content-type':'application/json'}});
+      }
+    }
+
     return new Response('LudoRoom alive', { status: 200 });
   }
 
-  handleSession(ws){
+  handleSession(ws, rejoinColor){
     ws.accept();
-    let color = COLORS.find(c => !this.joined.includes(c));
-    if(!color){
-      ws.send(JSON.stringify({type:'full'}));
-      ws.close();
-      return;
+    let color;
+    let isReconnect = false;
+    if(rejoinColor && this.joined.includes(rejoinColor) && !this.sessions.some(s=>s.color===rejoinColor)){
+      color = rejoinColor;
+      isReconnect = true;
+    } else {
+      const pool = poolFor(this.maxPlayers||4);
+      color = pool.find(c => !this.joined.includes(c));
+      if(!color){
+        ws.send(JSON.stringify({type:'full'}));
+        ws.close();
+        return;
+      }
+      this.joined.push(color);
     }
-    this.joined.push(color);
     const session = { ws, color };
     this.sessions.push(session);
 
     const need = this.maxPlayers || 4;
     let justStarted = false;
-    if(this.joined.length >= need && !this.game){
+    if(!isReconnect && this.joined.length >= need && !this.game){
       this.game = createGame(this.joined.slice());
+      if(this.pendingPrize) this.game.prize = this.pendingPrize;
       justStarted = true;
     }
 
@@ -129,7 +178,7 @@ export class LudoRoom {
 
     if(justStarted){
       this.broadcastAll({type:'action', actionKind:'start', game:this.game});
-    } else {
+    } else if(!isReconnect){
       this.broadcastLobby();
     }
 
@@ -153,8 +202,10 @@ export class LudoRoom {
   handleMessage(session, data){
     const g = this.game;
     if(data.type==='setPrize'){
-      if(g && !g.prize) g.prize = String(data.prize||'').slice(0,60);
-      this.broadcastAll({type:'action', actionKind:'prize', game:this.game});
+      const prize = String(data.prize||'').slice(0,60);
+      if(prize) this.pendingPrize = prize;
+      if(g && !g.prize && prize) g.prize = prize;
+      if(g) this.broadcastAll({type:'action', actionKind:'prize', game:this.game});
       return;
     }
     if(!g) return;
@@ -193,6 +244,11 @@ export default {
     if(url.pathname === '/webhook'){
       return handleTelegramWebhook(request, env);
     }
+    if(url.pathname === '/rate'){
+      const id = env.LUDO_ROOM.idFromName('__stats__');
+      const stub = env.LUDO_ROOM.get(id);
+      return stub.fetch(request);
+    }
     if(url.pathname.startsWith('/room/')){
       const code = url.pathname.split('/room/')[1];
       if(!code) return new Response('missing room code', {status:400});
@@ -215,10 +271,11 @@ async function handleTelegramWebhook(request, env){
       method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({
         chat_id: chatId,
-        text: 'به CACTUC لودو خوش اومدی! 🎲',
-        reply_markup: { inline_keyboard: [[
-          { text: '🎲 بازی کن', web_app: { url: workerUrl } }
-        ]]}
+        text: '🌵 به CACTUC لودو خوش اومدی!\n\nبا دوستات یه اتاق آنلاین بساز، جایزه‌ای برای برنده بذار، و ببین امروز کی پادشاهه 👑🎲',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🎲 بازی کن', web_app: { url: workerUrl } }],
+          [{ text: '📢 کانال ما', url: 'https://t.me/CROOK_Cake' }]
+        ]}
       })
     });
   }
@@ -245,8 +302,11 @@ const GAME_HTML = `<!DOCTYPE html>
     color: #fff; min-height: 100vh; display: flex; flex-direction: column;
     align-items: center; padding-bottom: 26px; touch-action: manipulation;
   }
-  #brandTitle { font-size: 28px; font-weight: 900; letter-spacing: 4px; margin: 14px 0 0;
+  #topRow { display:flex; align-items:center; justify-content:center; gap:10px; margin-top:14px; position:relative; width:100%; }
+  #brandTitle { font-size: 28px; font-weight: 900; letter-spacing: 4px;
     background: linear-gradient(160deg,#ffe9ad,#ffc93c); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  #gearBtn { position:absolute; right:16px; top:0; font-size:22px; background:rgba(255,255,255,0.1); border:none; border-radius:50%; width:36px; height:36px; color:#fff; }
+  [dir="rtl"] #gearBtn { right:auto; left:16px; }
   #subTitle { font-size: 13px; opacity: 0.9; margin: 0 0 6px; }
   #status { font-size: 14px; margin-bottom: 4px; min-height: 20px; text-align: center; padding: 0 16px; font-weight: bold; color: #fff; }
   #prizeBanner { font-size: 12px; opacity: 0.95; margin-bottom: 6px; padding: 3px 12px; background: rgba(255,209,102,0.18); border-radius: 12px; display: none; }
@@ -263,7 +323,11 @@ const GAME_HTML = `<!DOCTYPE html>
   .opt-btn.sel { border-color:#ffd166; background:#2c3160; }
   #joinCodeInput, #prizeSetupInput { width:100%; padding:12px; border-radius:12px; border:2px solid #3d4270;
     background:#171a35; color:#fff; font-size:16px; text-align:center; margin-top:8px; text-transform:uppercase; }
-  #roomCodeShow { font-size: 34px; font-weight:900; letter-spacing:6px; color:#ffd166; margin:14px 0; }
+  #roomCodeShow { font-size: 34px; font-weight:900; letter-spacing:6px; color:#ffd166; margin:12px 0 4px; }
+  #shareNote { font-size: 13px; opacity: 0.9; max-width: 320px; margin: 0 auto 8px; line-height:1.6; }
+  #copyBtn { padding: 8px 20px; border-radius: 14px; border: 1px solid #3d4270; background:#1e2240; color:#fff; font-size:13px; margin-bottom: 10px; }
+  #footerCredit { margin-top: 18px; font-size: 11px; opacity: 0.55; line-height: 1.7; text-align:center; }
+  #footerCredit .handle { direction: ltr; unicode-bidi: isolate; display: inline-block; }
 
   .ctrl-bar { direction: ltr; display: flex; justify-content: space-between; width: 94vw; max-width: 430px; margin: 4px 0; }
   .ctrl-slot { display: flex; align-items: center; gap: 4px; opacity: 0.45; transition: opacity 0.25s;
@@ -279,6 +343,9 @@ const GAME_HTML = `<!DOCTYPE html>
   .pip { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
   .pip span { width: 5.5px; height: 5.5px; border-radius: 50%; background: #222; display: none; }
   .pip.on span { display: block; }
+  .tap-hint { position: absolute; top: -14px; right: -6px; font-size: 15px; opacity: 0; animation: bounceHint 1s infinite; }
+  .ctrl-slot.enabled .tap-hint { opacity: 1; }
+  @keyframes bounceHint { 0%,100%{transform:translateY(0)} 50%{transform:translateY(4px)} }
 
   #board-wrap { width: 94vw; max-width: 430px; aspect-ratio: 1/1; position: relative; border-radius: 16px; overflow: hidden;
     box-shadow: 0 12px 32px rgba(0,0,0,0.55), 0 0 0 4px #1c2040; margin: 6px 0; }
@@ -290,18 +357,34 @@ const GAME_HTML = `<!DOCTYPE html>
   @keyframes hop { 0%{transform:translateY(0)} 40%{transform:translateY(-9px)} 100%{transform:translateY(0)} }
   .btn-row { display: flex; gap: 10px; margin-top: 6px; }
   .small-btn { background: #1e2240; color: #fff; border: 1px solid #3d4270; padding: 8px 18px; border-radius: 20px; font-size: 13px; }
+
+  #settingsOverlay { position: fixed; inset:0; background: rgba(6,8,22,0.95); display:none; align-items:center; justify-content:center; z-index:80; padding:24px; }
+  #settingsOverlay.show { display:flex; }
+  #settingsBox { max-width: 320px; width:100%; text-align:center; }
+  #settingsBox h3 { font-size: 18px; margin-bottom: 14px; }
+  .lang-btn { display:block; width:100%; margin:6px 0; padding:11px; border-radius:12px; border:2px solid #3d4270; background:#171a35; color:#fff; font-size:14px; }
+  .lang-btn.sel { border-color:#ffd166; background:#2c3160; }
+  #closeSettings { margin-top: 16px; padding: 10px 26px; border-radius: 18px; border:none; background:#2c3160; color:#fff; }
+
+  #ratingBox { display:none; text-align:center; margin-top: 14px; padding: 14px; background: rgba(255,255,255,0.06); border-radius: 16px; max-width: 340px; }
+  #ratingBox p { font-size: 13px; margin: 0 0 8px; }
+  .star { font-size: 30px; cursor: pointer; opacity: 0.35; padding: 0 2px; }
+  .star.on { opacity: 1; }
 </style>
 </head>
 <body>
 
-<div id="brandTitle">CACTUC</div>
+<div id="topRow">
+  <div id="brandTitle">CACTUC</div>
+  <button id="gearBtn">⚙️</button>
+</div>
 <div id="subTitle">🎲 Ludo Online</div>
 
 <div id="lobby">
-  <h2>بازی آنلاین لودو</h2>
-  <p>با دوستات از گوشی‌های جدا بازی کن</p>
+  <h2 id="lobbyHeading">بازی آنلاین لودو</h2>
+  <p id="lobbySub">با دوستات از گوشی‌های جدا بازی کن</p>
 
-  <div class="lobby-sub">چند نفره بسازیم؟</div>
+  <div class="lobby-sub" id="playersLabel">چند نفره بسازیم؟</div>
   <div class="opt-row">
     <div class="opt-btn sel" id="opt2">۲ نفره</div>
     <div class="opt-btn" id="opt3">۳ نفره</div>
@@ -313,15 +396,32 @@ const GAME_HTML = `<!DOCTYPE html>
   <button class="lobby-btn" id="joinBtn">پیوستن به اتاق</button>
   <input id="prizeSetupInput" placeholder="جایزه (اختیاری)" maxlength="40" style="margin-top:14px">
   <div id="waitingNote"></div>
+  <div id="footerCredit"></div>
 </div>
 
 <div id="gameArea" style="display:none; width:100%; align-items:center; flex-direction:column;">
   <div id="roomCodeShow"></div>
+  <div id="shareNote"></div>
+  <button id="copyBtn" style="display:none">📋 کپی کد</button>
   <div id="status"></div>
   <div id="prizeBanner"></div>
   <div class="ctrl-bar" id="topBar"></div>
   <div id="board-wrap"><svg id="board" viewBox="0 0 400 400"><g id="staticLayer"></g><g id="piecesLayer"></g></svg></div>
   <div class="ctrl-bar" id="bottomBar"></div>
+  <div id="ratingBox">
+    <p id="ratePrompt"></p>
+    <div>
+      <span class="star" data-v="1">★</span><span class="star" data-v="2">★</span><span class="star" data-v="3">★</span><span class="star" data-v="4">★</span><span class="star" data-v="5">★</span>
+    </div>
+  </div>
+</div>
+
+<div id="settingsOverlay">
+  <div id="settingsBox">
+    <h3 id="settingsTitle">Language</h3>
+    <div id="langList"></div>
+    <button id="closeSettings">OK</button>
+  </div>
 </div>
 
 <script>
@@ -357,6 +457,67 @@ function sndSlither(duration){
   osc.start(t0); osc.stop(t0+duration+0.05);
 }
 
+/* ---------- i18n ---------- */
+const I18N = {
+  en: { dir:'ltr', langName:'English', title:'🎲 Ludo Online', lobbyHeading:'Play Ludo Online', lobbySub:'Play with friends on separate phones',
+    playersLabel:'How many players?', p2:'2 Players', p3:'3 Players', p4:'4 Players', createBtn:'🎲 Create New Room',
+    joinPlaceholder:'Enter room code', joinBtn:'Join Room', prizePlaceholder:"Set the winner's prize (optional)",
+    shareNote:'Share this code with your friends and ask them to enter it under "Join Room".',
+    copyBtn:'📋 Copy Code', copied:'✅ Copied!', waiting:'Waiting for other players... ({j}/{m})',
+    turnRoll:"{n}'s turn — tap your dice", pickPiece:'{n}: pick a piece (dice: {v})', noMove:'{n}: no moves, next turn...',
+    win:'🎉 {n} is King! 🎉', presentPrize:'Prize for the winner: {p}', roomFull:'Room is full 😅', disconnected:'Connection lost 😔',
+    reconnecting:'Reconnecting...', settingsTitle:'Language', ok:'OK', footerLine1:'Creator: Nawid=cactuc', footerLine2:'Hope you enjoy the bot!',
+    ratePrompt:'How was it? Rate us!', rateThanks:'🙏 Thanks for your feedback!',
+    red:'Red', green:'Green', yellow:'Yellow', blue:'Blue' },
+  fa: { dir:'rtl', langName:'فارسی', title:'🎲 لودو آنلاین', lobbyHeading:'بازی آنلاین لودو', lobbySub:'با دوستات از گوشی‌های جدا بازی کن',
+    playersLabel:'چند نفره بسازیم؟', p2:'۲ نفره', p3:'۳ نفره', p4:'۴ نفره', createBtn:'🎲 ساخت اتاق جدید',
+    joinPlaceholder:'کد اتاق رو وارد کن', joinBtn:'پیوستن به اتاق', prizePlaceholder:'جایزه‌ی برنده رو تعیین کن (اختیاری)',
+    shareNote:'این کد رو به رفیقت بده و بگو تو «پیوستن به اتاق» واردش کنه.',
+    copyBtn:'📋 کپی کد', copied:'✅ کپی شد!', waiting:'منتظر بقیه‌ی بازیکنا... ({j}/{m})',
+    turnRoll:'نوبت {n}: تاس خودتو بزن', pickPiece:'{n}: مهره رو انتخاب کن (تاس: {v})', noMove:'{n}: حرکتی نداری، نوبت بعدی...',
+    win:'🎉 {n} پادشاه شد! 🎉', presentPrize:'جایزه رو تقدیم بقیه کن: {p}', roomFull:'اتاق پره 😅', disconnected:'اتصال قطع شد 😔',
+    reconnecting:'در حال وصل شدن دوباره...', settingsTitle:'زبان', ok:'باشه', footerLine1:'سازنده: Nawid=cactuc', footerLine2:'امیدوارم از ربات لذت ببرید 🥹',
+    ratePrompt:'بازی چطور بود؟ بهمون امتیاز بده', rateThanks:'🙏 ممنون از نظرت!',
+    red:'قرمز', green:'سبز', yellow:'زرد', blue:'آبی' },
+  ru: { dir:'ltr', langName:'Русский', title:'🎲 Лудо Онлайн', lobbyHeading:'Игра Лудо Онлайн', lobbySub:'Играйте с друзьями на разных телефонах',
+    playersLabel:'Сколько игроков?', p2:'2 игрока', p3:'3 игрока', p4:'4 игрока', createBtn:'🎲 Создать комнату',
+    joinPlaceholder:'Введите код комнаты', joinBtn:'Присоединиться', prizePlaceholder:'Приз для победителя (необязательно)',
+    shareNote:'Отправьте этот код друзьям и попросите ввести его в «Присоединиться к комнате».',
+    copyBtn:'📋 Копировать код', copied:'✅ Скопировано!', waiting:'Ожидание игроков... ({j}/{m})',
+    turnRoll:'Ход {n} — нажмите свой кубик', pickPiece:'{n}: выберите фишку (кубик: {v})', noMove:'{n}: нет ходов, следующий ход...',
+    win:'🎉 {n} — король! 🎉', presentPrize:'Приз победителю: {p}', roomFull:'Комната заполнена 😅', disconnected:'Соединение потеряно 😔',
+    reconnecting:'Переподключение...', settingsTitle:'Язык', ok:'ОК', footerLine1:'Автор: Nawid=cactuc', footerLine2:'Надеемся, вам понравится бот!',
+    ratePrompt:'Как вам игра? Оцените нас!', rateThanks:'🙏 Спасибо за отзыв!',
+    red:'Красный', green:'Зелёный', yellow:'Жёлтый', blue:'Синий' },
+  ar: { dir:'rtl', langName:'العربية', title:'🎲 لودو أونلاين', lobbyHeading:'العب لودو أونلاين', lobbySub:'العب مع أصدقائك من هواتف منفصلة',
+    playersLabel:'كم عدد اللاعبين؟', p2:'لاعبان', p3:'٣ لاعبين', p4:'٤ لاعبين', createBtn:'🎲 إنشاء غرفة جديدة',
+    joinPlaceholder:'أدخل رمز الغرفة', joinBtn:'الانضمام إلى الغرفة', prizePlaceholder:'حدد جائزة الفائز (اختياري)',
+    shareNote:'شارك هذا الرمز مع أصدقائك واطلب منهم إدخاله في «الانضمام إلى الغرفة».',
+    copyBtn:'📋 نسخ الرمز', copied:'✅ تم النسخ!', waiting:'بانتظار بقية اللاعبين... ({j}/{m})',
+    turnRoll:'دور {n} — اضغط على نردك', pickPiece:'{n}: اختر قطعة (النرد: {v})', noMove:'{n}: لا حركة، الدور التالي...',
+    win:'🎉 {n} أصبح الملك! 🎉', presentPrize:'الجائزة للفائز: {p}', roomFull:'الغرفة ممتلئة 😅', disconnected:'انقطع الاتصال 😔',
+    reconnecting:'إعادة الاتصال...', settingsTitle:'اللغة', ok:'حسناً', footerLine1:'صانع اللعبة: Nawid=cactuc', footerLine2:'نتمنى أن تستمتع بالبوت!',
+    ratePrompt:'كيف كانت اللعبة؟ قيّمنا!', rateThanks:'🙏 شكراً لتقييمك!',
+    red:'أحمر', green:'أخضر', yellow:'أصفر', blue:'أزرق' },
+  de: { dir:'ltr', langName:'Deutsch', title:'🎲 Ludo Online', lobbyHeading:'Ludo Online spielen', lobbySub:'Spiele mit Freunden auf getrennten Handys',
+    playersLabel:'Wie viele Spieler?', p2:'2 Spieler', p3:'3 Spieler', p4:'4 Spieler', createBtn:'🎲 Neuen Raum erstellen',
+    joinPlaceholder:'Raumcode eingeben', joinBtn:'Raum beitreten', prizePlaceholder:'Preis für den Gewinner festlegen (optional)',
+    shareNote:'Teile diesen Code mit deinen Freunden und lass sie ihn unter „Raum beitreten" eingeben.',
+    copyBtn:'📋 Code kopieren', copied:'✅ Kopiert!', waiting:'Warte auf weitere Spieler... ({j}/{m})',
+    turnRoll:'{n} ist dran — eigenen Würfel tippen', pickPiece:'{n}: Figur wählen (Würfel: {v})', noMove:'{n}: kein Zug möglich, nächster...',
+    win:'🎉 {n} ist König! 🎉', presentPrize:'Preis für den Gewinner: {p}', roomFull:'Raum ist voll 😅', disconnected:'Verbindung verloren 😔',
+    reconnecting:'Verbinde erneut...', settingsTitle:'Sprache', ok:'OK', footerLine1:'Erstellt von: Nawid=cactuc', footerLine2:'Wir hoffen, der Bot gefällt dir!',
+    ratePrompt:'Wie war es? Bewerte uns!', rateThanks:'🙏 Danke für dein Feedback!',
+    red:'Rot', green:'Grün', yellow:'Gelb', blue:'Blau' }
+};
+let lang = 'fa';
+function t(key, params){
+  let s = I18N[lang][key] || key;
+  if(params) for(const k in params) s = s.replace('{'+k+'}', params[k]);
+  return s;
+}
+function meWord(){ return {fa:'تو',en:'you',ru:'ты',ar:'أنت',de:'du'}[lang]; }
+
 const CELL = 400/15;
 const COLORS = ['red','green','yellow','blue'];
 const HEX = { red:'#e84040', green:'#2fae5a', yellow:'#f0c419', blue:'#2f7fe0' };
@@ -384,6 +545,8 @@ function yardXY(color, slot){
 const FINISH_POS = 55;
 let myColor = null, activeColors = [], state = null, animating=false, ws=null, roomCode='';
 let chosenMax = 2;
+let ratingGiven = false;
+let reconnecting = false;
 
 function drawStatic(){
   let html = '<rect x="0" y="0" width="400" height="400" fill="#f3f5fb"/>';
@@ -423,7 +586,7 @@ function drawStatic(){
   document.getElementById('staticLayer').innerHTML = html;
 }
 
-function pinSVG(x, y, color, cls, showRing){
+function pinSVG(x, y, color, idx, cls, showRing){
   const hex = HEX[color], dark = DARK[color];
   let ring = '';
   if(showRing){
@@ -431,7 +594,7 @@ function pinSVG(x, y, color, cls, showRing){
       <animateTransform attributeName="transform" type="rotate" from="0 \${x} \${y-5}" to="360 \${x} \${y-5}" dur="1.6s" repeatCount="indefinite"/>
     </circle>\`;
   }
-  return \`<g class="piece \${cls}" data-color="\${color}">
+  return \`<g class="piece \${cls}" data-color="\${color}" data-idx="\${idx}">
     \${ring}
     <ellipse cx="\${x}" cy="\${y+9}" rx="7.5" ry="2.4" fill="#000" opacity="0.2"/>
     <g class="pin">
@@ -444,18 +607,38 @@ function pinSVG(x, y, color, cls, showRing){
 
 function drawPiecesFixed(){
   if(!state) return;
-  let html = '';
-  const meta = [];
+  const curColor = state.order[state.turn];
+  let entries = [];
   activeColors.forEach(c=>{
-    if(state.finished[c]===4) return;
     state.pieces[c].forEach((pos, idx)=>{
+      if(pos===FINISH_POS) return;
       let x,y;
       if(pos===-1){ [x,y]=yardXY(c,idx); } else { [x,y]=relToAbsCell(c,pos); }
-      const isMovable = myColor===c && state.movable.some(m=>m.piece===idx) && state.order[state.turn]===c;
-      const cls = isMovable ? 'piece-normal movable' : 'piece-normal';
-      html += pinSVG(x,y,c,cls, isMovable);
-      meta.push({c,idx});
+      const isMovableVisual = c===curColor && state.movable.some(m=>m.piece===idx);
+      const isClickable = isMovableVisual && myColor===c;
+      entries.push({c, idx, x, y, isMovableVisual, isClickable, pos});
     });
+  });
+  const groups = {};
+  entries.forEach(e=>{
+    if(e.pos===-1) return;
+    const key = Math.round(e.x)+'_'+Math.round(e.y);
+    (groups[key] = groups[key]||[]).push(e);
+  });
+  Object.values(groups).forEach(grp=>{
+    if(grp.length<2) return;
+    grp.forEach((e,i)=>{
+      const ang = (i/grp.length)*2*Math.PI;
+      e.x += Math.cos(ang)*7;
+      e.y += Math.sin(ang)*7;
+    });
+  });
+  entries.sort((a,b)=> (a.isClickable?1:0) - (b.isClickable?1:0));
+
+  let html = '';
+  entries.forEach(e=>{
+    const cls = e.isClickable ? 'piece-normal movable' : 'piece-normal';
+    html += pinSVG(e.x, e.y, e.c, e.idx, cls, e.isMovableVisual);
   });
   activeColors.forEach(c=>{
     if(state.finished[c]===4){
@@ -468,12 +651,10 @@ function drawPiecesFixed(){
   });
   const layer = document.getElementById('piecesLayer');
   layer.innerHTML = html;
-  const groups = layer.querySelectorAll('.piece');
-  groups.forEach((el,i)=>{
-    if(el.classList.contains('movable')){
-      const m = meta[i];
-      el.addEventListener('click', ()=> sendMove(m.idx));
-    }
+  layer.querySelectorAll('.piece.movable').forEach(el=>{
+    const c = el.getAttribute('data-color');
+    const idx = parseInt(el.getAttribute('data-idx'));
+    el.addEventListener('click', ()=> sendMove(idx));
   });
 }
 
@@ -492,21 +673,22 @@ function celebrationBurst(x,y,color){
   layer.insertAdjacentHTML('beforeend', extra);
 }
 
-const COLOR_NAME = { red:'قرمز', green:'سبز', yellow:'زرد', blue:'آبی' };
+function colorName(c){ return t(c); }
 
 function renderUI(){
   const st = document.getElementById('status');
   const pb = document.getElementById('prizeBanner');
-  if(state && state.prize){ pb.style.display='inline-block'; pb.textContent = '🏆 جایزه: '+state.prize; }
+  if(state && state.prize){ pb.style.display='inline-block'; pb.textContent = '🏆 '+state.prize; }
   else pb.style.display='none';
 
   if(!state){ return; }
-  if(state.gameOver) return;
-  const curC = state.order[state.turn];
-  const name = COLOR_NAME[curC] + (curC===myColor?' (تو)':'');
-  if(state.diceValue===null) st.textContent = 'نوبت '+name+': تاس بزن';
-  else if(state.movable.length===0) st.textContent = name+': حرکتی نیست...';
-  else st.textContent = name+': مهره رو انتخاب کن (تاس: '+state.diceValue+')';
+  if(!state.gameOver){
+    const curC = state.order[state.turn];
+    const name = colorName(curC) + (curC===myColor?' ('+meWord()+')':'');
+    if(state.diceValue===null) st.textContent = t('turnRoll',{n:name});
+    else if(state.movable.length===0) st.textContent = t('noMove',{n:name});
+    else st.textContent = t('pickPiece',{n:name, v:state.diceValue});
+  }
 
   COLORS.forEach(c=>{
     const slot = document.getElementById('slot-'+c);
@@ -539,7 +721,8 @@ function buildBars(){
     const slot = document.createElement('div');
     slot.className='ctrl-slot'; slot.id='slot-'+c;
     slot.innerHTML = \`<div class="pin-ico" style="background:\${HEX[c]}"></div>
-      <div class="mini-dice" id="dice-\${c}">\${pipGridHTML()}</div>\`;
+      <div class="mini-dice" id="dice-\${c}">\${pipGridHTML()}</div>
+      <div class="tap-hint">👆</div>\`;
     slot.querySelector('.mini-dice').addEventListener('click', ()=> sendRoll(c));
     return slot;
   }
@@ -576,6 +759,26 @@ function enterGame(game){
   document.getElementById('gameArea').style.display='flex';
   buildBars(); drawStatic(); render();
 }
+
+function showRatingBox(){
+  ratingGiven = false;
+  const box = document.getElementById('ratingBox');
+  document.getElementById('ratePrompt').textContent = t('ratePrompt');
+  box.querySelectorAll('.star').forEach(s=> s.classList.remove('on'));
+  box.style.display = 'block';
+}
+document.querySelectorAll('.star').forEach(star=>{
+  star.addEventListener('click', ()=>{
+    if(ratingGiven) return;
+    ratingGiven = true;
+    const v = parseInt(star.getAttribute('data-v'));
+    document.querySelectorAll('.star').forEach(s=>{
+      s.classList.toggle('on', parseInt(s.getAttribute('data-v'))<=v);
+    });
+    fetch('/rate', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({stars:v}) }).catch(()=>{});
+    document.getElementById('ratePrompt').textContent = t('rateThanks');
+  });
+});
 
 async function replayAction(action){
   if(action.actionKind==='start'){
@@ -615,38 +818,67 @@ async function replayAction(action){
     clearAllDiceFaces();
     state = action.game;
     animating=false;
-    if(state.gameOver){ sndWin(); document.getElementById('status').textContent = '🎉 '+COLOR_NAME[state.finishOrder[0]]+' پادشاه شد! 🎉' + (state.prize? ' — 🏆 '+state.prize:''); }
+    if(state.gameOver){
+      sndWin();
+      let msg = t('win',{n:colorName(state.finishOrder[0])});
+      if(state.prize) msg += ' — ' + t('presentPrize',{p:state.prize});
+      document.getElementById('status').textContent = msg;
+      showRatingBox();
+    }
     render();
   }
 }
 
-function connect(code, prize, max){
+function scheduleReconnect(){
+  if(reconnecting || !myColor || !roomCode) return;
+  reconnecting = true;
+  document.getElementById('status').textContent = t('reconnecting');
+  setTimeout(()=>{ reconnecting = false; connect(roomCode, '', null, myColor); }, 1500);
+}
+
+function connect(code, prize, max, rejoinColor){
   roomCode = code.toUpperCase();
+  document.getElementById('lobby').style.display='none';
+  document.getElementById('gameArea').style.display='flex';
   document.getElementById('roomCodeShow').textContent = roomCode;
+  if(max){
+    document.getElementById('shareNote').textContent = t('shareNote');
+    const cbtn = document.getElementById('copyBtn');
+    cbtn.style.display='inline-block';
+    cbtn.textContent = t('copyBtn');
+    cbtn.onclick = ()=>{
+      const ta=document.createElement('textarea'); ta.value=roomCode; document.body.appendChild(ta);
+      ta.select(); try{ document.execCommand('copy'); }catch(e){}
+      document.body.removeChild(ta);
+      cbtn.textContent = t('copied');
+      setTimeout(()=> cbtn.textContent = t('copyBtn'), 1500);
+    };
+  }
   const proto = location.protocol==='https:' ? 'wss:' : 'ws:';
   let wsUrl = proto+'//'+location.host+'/room/'+roomCode;
-  if(max) wsUrl += '?max='+max;
+  const params = [];
+  if(max) params.push('max='+max);
+  if(rejoinColor) params.push('rejoin='+rejoinColor);
+  if(params.length) wsUrl += '?'+params.join('&');
   ws = new WebSocket(wsUrl);
   ws.addEventListener('open', ()=>{
     if(prize) ws.send(JSON.stringify({type:'setPrize', prize}));
   });
   ws.addEventListener('message', (evt)=>{
     const data = JSON.parse(evt.data);
-    if(data.type==='full'){ alert('اتاق پره 😅'); return; }
+    if(data.type==='full'){ alert(t('roomFull')); return; }
     if(data.type==='welcome'){
       myColor = data.color;
       if(data.game){
         enterGame(data.game);
       } else {
-        document.getElementById('gameArea').style.display='flex';
-        document.getElementById('lobby').style.display='none';
-        document.getElementById('status').textContent = 'منتظر بقیه‌ی بازیکنا... ('+data.joined.length+'/'+data.max+')';
+        document.getElementById('status').textContent = t('waiting',{j:data.joined.length, m:data.max});
       }
       return;
     }
     if(data.type==='lobby'){
       if(!state){
-        document.getElementById('status').textContent = 'منتظر بقیه‌ی بازیکنا... ('+data.joined.length+'/'+data.max+')';
+        document.getElementById('status').textContent = t('waiting',{j:data.joined.length, m:data.max});
       }
       return;
     }
@@ -655,7 +887,11 @@ function connect(code, prize, max){
     }
   });
   ws.addEventListener('close', ()=>{
-    if(document.getElementById('status')) document.getElementById('status').textContent = 'اتصال قطع شد 😔';
+    if(state && !state.gameOver){
+      scheduleReconnect();
+    } else if(document.getElementById('status') && !state){
+      document.getElementById('status').textContent = t('disconnected');
+    }
   });
 }
 
@@ -682,9 +918,48 @@ document.getElementById('createBtn').addEventListener('click', ()=>{
 document.getElementById('joinBtn').addEventListener('click', ()=>{
   ensureAudio();
   const code = document.getElementById('joinCodeInput').value.trim();
-  if(code.length!==4){ alert('کد ۴ کاراکتریه'); return; }
+  if(code.length!==4){ alert(lang==='fa'?'کد ۴ کاراکتریه':'Code is 4 characters'); return; }
   connect(code, '', null);
 });
+
+function applyLangToLobby(){
+  document.documentElement.dir = I18N[lang].dir;
+  document.getElementById('subTitle').textContent = t('title');
+  document.getElementById('lobbyHeading').textContent = t('lobbyHeading');
+  document.getElementById('lobbySub').textContent = t('lobbySub');
+  document.getElementById('playersLabel').textContent = t('playersLabel');
+  document.getElementById('opt2').textContent = t('p2');
+  document.getElementById('opt3').textContent = t('p3');
+  document.getElementById('opt4').textContent = t('p4');
+  document.getElementById('createBtn').textContent = t('createBtn');
+  document.getElementById('joinCodeInput').placeholder = t('joinPlaceholder');
+  document.getElementById('joinBtn').textContent = t('joinBtn');
+  document.getElementById('prizeSetupInput').placeholder = t('prizePlaceholder');
+  document.getElementById('footerCredit').innerHTML = t('footerLine1').replace('Nawid=cactuc','<span class="handle">Nawid=cactuc</span>') + '<br>' + t('footerLine2');
+  document.getElementById('settingsTitle').textContent = t('settingsTitle');
+  document.getElementById('closeSettings').textContent = t('ok');
+  if(state) render();
+}
+function buildLangList(){
+  const box = document.getElementById('langList');
+  box.innerHTML = '';
+  Object.keys(I18N).forEach(code=>{
+    const b = document.createElement('div');
+    b.className = 'lang-btn' + (code===lang?' sel':'');
+    b.textContent = I18N[code].langName;
+    b.onclick = ()=>{ lang=code; buildLangList(); applyLangToLobby(); };
+    box.appendChild(b);
+  });
+}
+document.getElementById('gearBtn').addEventListener('click', ()=>{
+  buildLangList();
+  document.getElementById('settingsOverlay').classList.add('show');
+});
+document.getElementById('closeSettings').addEventListener('click', ()=>{
+  document.getElementById('settingsOverlay').classList.remove('show');
+});
+
+applyLangToLobby();
 </script>
 </body>
 </html>`;
