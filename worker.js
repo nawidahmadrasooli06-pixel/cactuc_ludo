@@ -538,7 +538,7 @@ const I18N = {
     win:'🎉 {n} is King! 🎉', presentPrize:'Prize for the winner: {p}', roomFull:'Room is full 😅', disconnected:'Connection lost 😔',
     reconnecting:'Reconnecting...', resumeText:'You have an unfinished game (code: {c})', resumeBtn:'▶️ Resume Game',
     settingsTitle:'Language', ok:'OK', footerLine1:'Creator: Nawid=cactuc', footerLine2:'Hope you enjoy the bot!',
-    ratePrompt:'How was it? Rate us!', rateThanks:'🙏 Thanks for your feedback!',
+    ratePrompt:'How was it? Rate us!', rateThanks:'🙏 Thanks for your feedback!', loser:'Last Place',
     red:'Red', green:'Green', yellow:'Yellow', blue:'Blue' },
   fa: { dir:'rtl', langName:'فارسی', title:'🎲 لودو آنلاین', lobbyHeading:'بازی آنلاین لودو', lobbySub:'با دوستات از گوشی‌های جدا بازی کن',
     playersLabel:'چند نفره بسازیم؟', p2:'۲ نفره', p3:'۳ نفره', p4:'۴ نفره', createBtn:'🎲 ساخت اتاق جدید',
@@ -549,7 +549,7 @@ const I18N = {
     win:'🎉 {n} پادشاه شد! 🎉', presentPrize:'جایزه رو تقدیم بقیه کن: {p}', roomFull:'اتاق پره 😅', disconnected:'اتصال قطع شد 😔',
     reconnecting:'در حال وصل شدن دوباره...', resumeText:'یه بازی نیمه‌کاره داری (کد: {c})', resumeBtn:'▶️ ادامه‌ی بازی',
     settingsTitle:'زبان', ok:'باشه', footerLine1:'سازنده: Nawid=cactuc', footerLine2:'امیدوارم از ربات لذت ببرید 🥹',
-    ratePrompt:'بازی چطور بود؟ بهمون امتیاز بده', rateThanks:'🙏 ممنون از نظرت!',
+    ratePrompt:'بازی چطور بود؟ بهمون امتیاز بده', rateThanks:'🙏 ممنون از نظرت!', loser:'بازنده میدان',
     red:'قرمز', green:'سبز', yellow:'زرد', blue:'آبی' },
   ru: { dir:'ltr', langName:'Русский', title:'🎲 Лудо Онлайн', lobbyHeading:'Игра Лудо Онлайн', lobbySub:'Играйте с друзьями на разных телефонах',
     playersLabel:'Сколько игроков?', p2:'2 игрока', p3:'3 игрока', p4:'4 игрока', createBtn:'🎲 Создать комнату',
@@ -560,7 +560,7 @@ const I18N = {
     win:'🎉 {n} — король! 🎉', presentPrize:'Приз победителю: {p}', roomFull:'Комната заполнена 😅', disconnected:'Соединение потеряно 😔',
     reconnecting:'Переподключение...', resumeText:'У вас есть незавершённая игра (код: {c})', resumeBtn:'▶️ Продолжить игру',
     settingsTitle:'Язык', ok:'ОК', footerLine1:'Автор: Nawid=cactuc', footerLine2:'Надеемся, вам понравится бот!',
-    ratePrompt:'Как вам игра? Оцените нас!', rateThanks:'🙏 Спасибо за отзыв!',
+    ratePrompt:'Как вам игра? Оцените нас!', rateThanks:'🙏 Спасибо за отзыв!', loser:'Последнее место',
     red:'Красный', green:'Зелёный', yellow:'Жёлтый', blue:'Синий' },
   ar: { dir:'rtl', langName:'العربية', title:'🎲 لودو أونلاين', lobbyHeading:'العب لودو أونلاين', lobbySub:'العب مع أصدقائك من هواتف منفصلة',
     playersLabel:'كم عدد اللاعبين؟', p2:'لاعبان', p3:'٣ لاعبين', p4:'٤ لاعبين', createBtn:'🎲 إنشاء غرفة جديدة',
@@ -571,7 +571,7 @@ const I18N = {
     win:'🎉 {n} أصبح الملك! 🎉', presentPrize:'الجائزة للفائز: {p}', roomFull:'الغرفة ممتلئة 😅', disconnected:'انقطع الاتصال 😔',
     reconnecting:'إعادة الاتصال...', resumeText:'لديك لعبة غير مكتملة (الرمز: {c})', resumeBtn:'▶️ متابعة اللعبة',
     settingsTitle:'اللغة', ok:'حسناً', footerLine1:'صانع اللعبة: Nawid=cactuc', footerLine2:'نتمنى أن تستمتع بالبوت!',
-    ratePrompt:'كيف كانت اللعبة؟ قيّمنا!', rateThanks:'🙏 شكراً لتقييمك!',
+    ratePrompt:'كيف كانت اللعبة؟ قيّمنا!', rateThanks:'🙏 شكراً لتقييمك!', loser:'الخاسر',
     red:'أحمر', green:'أخضر', yellow:'أصفر', blue:'أزرق' },
   de: { dir:'ltr', langName:'Deutsch', title:'🎲 Ludo Online', lobbyHeading:'Ludo Online spielen', lobbySub:'Spiele mit Freunden auf getrennten Handys',
     playersLabel:'Wie viele Spieler?', p2:'2 Spieler', p3:'3 Spieler', p4:'4 Spieler', createBtn:'🎲 Neuen Raum erstellen',
@@ -582,7 +582,7 @@ const I18N = {
     win:'🎉 {n} ist König! 🎉', presentPrize:'Preis für den Gewinner: {p}', roomFull:'Raum ist voll 😅', disconnected:'Verbindung verloren 😔',
     reconnecting:'Verbinde erneut...', resumeText:'Du hast ein unbeendetes Spiel (Code: {c})', resumeBtn:'▶️ Spiel fortsetzen',
     settingsTitle:'Sprache', ok:'OK', footerLine1:'Erstellt von: Nawid=cactuc', footerLine2:'Wir hoffen, der Bot gefällt dir!',
-    ratePrompt:'Wie war es? Bewerte uns!', rateThanks:'🙏 Danke für dein Feedback!',
+    ratePrompt:'Wie war es? Bewerte uns!', rateThanks:'🙏 Danke für dein Feedback!', loser:'Letzter Platz',
     red:'Rot', green:'Grün', yellow:'Gelb', blue:'Blau' }
 };
 let lang = 'fa';
@@ -669,12 +669,17 @@ function drawStatic(){
 function pinSVG(x, y, color, idx, cls, showRing){
   const hex = HEX[color], dark = DARK[color];
   let ring = '';
+  let hitArea = '';
   if(showRing){
     ring = \`<circle cx="\${x}" cy="\${y-5}" r="15" fill="none" stroke="#111319" stroke-width="2.4" stroke-dasharray="6 5" opacity="0.9">
       <animateTransform attributeName="transform" type="rotate" from="0 \${x} \${y-5}" to="360 \${x} \${y-5}" dur="1.6s" repeatCount="indefinite"/>
     </circle>\`;
   }
+  if(cls.indexOf('movable')!==-1){
+    hitArea = \`<circle cx="\${x}" cy="\${y}" r="17" fill="#000" opacity="0.001"/>\`;
+  }
   return \`<g class="piece \${cls}" data-color="\${color}" data-idx="\${idx}">
+    \${hitArea}
     \${ring}
     <ellipse cx="\${x}" cy="\${y+9}" rx="7.5" ry="2.4" fill="#000" opacity="0.2"/>
     <g class="pin">
@@ -727,6 +732,11 @@ function drawPiecesFixed(){
       html += \`<rect x="\${c0*CELL}" y="\${r0*CELL}" width="\${6*CELL}" height="\${6*CELL}" fill="#0a0d1f" opacity="0.6"/>\`;
       html += \`<text x="\${(c0+3)*CELL}" y="\${(r0+2.7)*CELL}" text-anchor="middle" font-size="22">👑</text>\`;
       html += \`<text x="\${(c0+3)*CELL}" y="\${(r0+3.6)*CELL}" text-anchor="middle" font-size="15" fill="#ffd166" font-weight="bold">King (\${rank})</text>\`;
+    } else if(state.gameOver){
+      const [r0,c0] = CORNER[c];
+      html += \`<rect x="\${c0*CELL}" y="\${r0*CELL}" width="\${6*CELL}" height="\${6*CELL}" fill="#3a0d0d" opacity="0.65"/>\`;
+      html += \`<text x="\${(c0+3)*CELL}" y="\${(r0+2.7)*CELL}" text-anchor="middle" font-size="22">😢</text>\`;
+      html += \`<text x="\${(c0+3)*CELL}" y="\${(r0+3.6)*CELL}" text-anchor="middle" font-size="14" fill="#ffb3b3" font-weight="bold">\${t('loser')}</text>\`;
     }
   });
   const layer = document.getElementById('piecesLayer');
@@ -740,16 +750,26 @@ function drawPiecesFixed(){
 function celebrationBurst(x,y,color){
   const layer = document.getElementById('piecesLayer');
   let extra = '';
-  for(let i=0;i<12;i++){
-    const ang = (i/12)*360;
-    const dx = Math.cos(ang*Math.PI/180)*46, dy = Math.sin(ang*Math.PI/180)*46;
-    extra += \`<circle cx="\${x}" cy="\${y}" r="3.4" fill="\${HEX[color]}">
-      <animate attributeName="cx" from="\${x}" to="\${x+dx}" dur="0.75s" fill="freeze"/>
-      <animate attributeName="cy" from="\${y}" to="\${y+dy}" dur="0.75s" fill="freeze"/>
-      <animate attributeName="opacity" from="1" to="0" dur="0.75s" fill="freeze"/>
+  for(let i=0;i<20;i++){
+    const ang = (i/20)*360;
+    const dist = 55 + Math.random()*20;
+    const dx = Math.cos(ang*Math.PI/180)*dist, dy = Math.sin(ang*Math.PI/180)*dist;
+    const r = 2.5 + Math.random()*2.5;
+    extra += \`<circle cx="\${x}" cy="\${y}" r="\${r}" fill="\${HEX[color]}">
+      <animate attributeName="cx" from="\${x}" to="\${x+dx}" dur="0.85s" fill="freeze"/>
+      <animate attributeName="cy" from="\${y}" to="\${y+dy}" dur="0.85s" fill="freeze"/>
+      <animate attributeName="opacity" from="1" to="0" dur="0.85s" fill="freeze"/>
     </circle>\`;
   }
   layer.insertAdjacentHTML('beforeend', extra);
+}
+async function fireworksShow(){
+  for(let i=0;i<7;i++){
+    const x = 50+Math.random()*300, y=50+Math.random()*300;
+    const col = COLORS[Math.floor(Math.random()*COLORS.length)];
+    celebrationBurst(x,y,col);
+    await sleep(230);
+  }
 }
 
 function colorName(c){ return t(c); }
@@ -906,8 +926,10 @@ async function replayAction(action){
       document.getElementById('status').textContent = msg;
       showRatingBox();
       clearSession();
+      render();
+      fireworksShow();
+      return;
     }
-    render();
   }
 }
 
